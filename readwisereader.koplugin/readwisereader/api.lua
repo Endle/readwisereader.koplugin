@@ -100,7 +100,9 @@ function ReadwiseAPI:handleRetryAfter(code, headers)
     return false
 end
 
-function ReadwiseAPI:requestReader(method, endpoint, body)
+-- `quick` is for requests made while the user reads: one attempt with short
+-- timeouts and no waiting on rate limits, so a bad connection costs seconds.
+function ReadwiseAPI:requestReader(method, endpoint, body, quick)
     local headers = {
         ["Authorization"] = "Token " .. self.get_token(),
         ["Content-Type"] = "application/json",
@@ -122,7 +124,7 @@ function ReadwiseAPI:requestReader(method, endpoint, body)
 
     logger.dbg("ReadwiseAPI:requestReader:", method, endpoint)
 
-    local max_attempts = 3
+    local max_attempts = quick and 1 or 3
     local code, resp_headers, status
 
     for attempt = 1, max_attempts do
@@ -132,8 +134,12 @@ function ReadwiseAPI:requestReader(method, endpoint, body)
             request.source = ltn12.source.string(json_body)
         end
 
-        self:checkRateLimit()
-        socketutil:set_timeout(10, 60)
+        if quick then
+            socketutil:set_timeout(5, 15)
+        else
+            self:checkRateLimit()
+            socketutil:set_timeout(10, 60)
+        end
         code, resp_headers, status = socket.skip(1, http.request(request))
         socketutil:reset_timeout()
 
