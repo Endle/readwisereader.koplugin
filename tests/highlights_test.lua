@@ -53,7 +53,7 @@ local modules = {
         close = noop,
     },
     clip = object,
-    device = { isKindle = function() return false end },
+    device = { isKindle = function() return false end, canSuspend = function() return false end },
     util = {
         splitFilePathName = function(path) return path:match("^(.-)([^/]+)$") end,
     },
@@ -104,7 +104,7 @@ local unused = {
     "ui/bidi", "docsettings", "ui/event", "ffi/util", "apps/filemanager/filemanager",
     "ui/widget/inputdialog", "ui/widget/confirmbox", "ui/widget/multiconfirmbox",
     "readcollection", "ui/network/manager", "readhistory", "apps/filemanager/filemanagerutil",
-    "libs/libkoreader-lfs", "mime", "ui/renderimage",
+    "libs/libkoreader-lfs", "mime", "ui/renderimage", "ui/widget/notification",
 }
 for _, name in ipairs(unused) do modules[name] = {} end
 for name, module in pairs(modules) do

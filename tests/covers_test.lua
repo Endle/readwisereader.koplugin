@@ -271,6 +271,8 @@ local empty_modules = {
 for _, name in ipairs(empty_modules) do package.preload[name] = function() return {} end end
 package.preload["ui/widget/container/widgetcontainer"] = function() return object end
 package.preload["ui/widget/infomessage"] = function() return object end
+package.preload["ui/widget/notification"] = function() return object end
+package.preload.device = function() return { canSuspend = function() return false end } end
 package.preload.gettext = function() return function(s) return s end end
 package.preload.util = function() return { getSafeFilename = function(title) return title end } end
 local ui = require("ui/uimanager")

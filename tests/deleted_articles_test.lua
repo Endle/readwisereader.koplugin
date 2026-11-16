@@ -74,7 +74,7 @@ local modules = {
         end,
     },
     clip = object,
-    device = { isKindle = function() return false end },
+    device = { isKindle = function() return false end, canSuspend = function() return false end },
     util = {
         splitFilePathName = function(path) return path:match("^(.-)([^/]+)$") end,
         getSafeFilename = function(title) return title end,
@@ -85,7 +85,7 @@ local unused = {
     "ui/bidi", "ui/event", "ffi/util", "ui/widget/inputdialog",
     "ui/widget/multiconfirmbox", "readcollection", "ui/network/manager", "readhistory",
     "apps/filemanager/filemanagerutil", "socket.http", "ltn12", "mime", "socket",
-    "socketutil", "json", "rapidjson", "ui/renderimage",
+    "socketutil", "json", "rapidjson", "ui/renderimage", "ui/widget/notification",
 }
 for _, name in ipairs(unused) do modules[name] = {} end
 for name, module in pairs(modules) do

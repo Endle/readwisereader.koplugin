@@ -13,6 +13,7 @@
 -- - Offers filtering by article tags, location, type and site name (via series)
 -- - Archives finished articles back to Readwise
 -- - Exports highlights and notes to Readwise
+-- - Syncs the reading position of downloaded documents with Reader, both ways
 -- - Handles incremental sync with cleanup of archived content
 -- - Fixed author metadata handling for proper highlight export
 -- - Enhanced URL corruption detection and repair for all image sources
@@ -27,6 +28,7 @@ local logger = require("logger")
 local ReadwiseAPI = require("readwisereader/api")
 local HighlightExporter = require("readwisereader/highlights")
 local ReaderCovers = require("readwisereader/covers")
+local ReadingProgress = require("readwisereader/progress")
 
 local BD = require("ui/bidi")
 local DataStorage = require("datastorage")
@@ -47,6 +49,7 @@ if not ok then
 end
 local MyClipping = require("clip")
 local NetworkMgr = require("ui/network/manager")
+local Notification = require("ui/widget/notification")
 local ReadHistory = require("readhistory")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -79,6 +82,12 @@ function ReadwiseReader:onDispatcherRegisterActions()
         event = "SynchronizeReadwiseReader",
         title = "Readwise Reader sync",
         general = true,
+    })
+    Dispatcher:registerAction("readwisereader_sync_position", {
+        category = "none",
+        event = "SyncReadwiseReadingPosition",
+        title = "Readwise Reader sync reading position",
+        reader = true,
     })
 end
 
@@ -121,6 +130,30 @@ function ReadwiseReader:init()
     -- Reader highlight IDs and the notes sent with them, keyed by document and passage.
     -- Keep these after cleanup so re-downloaded articles retain export history.
     self.reader_highlights = settings.reader_highlights or {}
+
+    -- Reading position follows Reader's reading_progress, on by default.
+    self.sync_reading_position = settings.sync_reading_position ~= false
+    self.progress_task = function()
+        local mode = self.progress_pending
+        if not (mode and self.progress_ready) then
+            self.progress_pending = nil
+        elseif self.progress_job then
+            -- One sync at a time: try again once the answer on its way is in.
+            UIManager:scheduleIn(2, self.progress_task)
+        else
+            self.progress_pending = nil
+            self:syncReadingPosition(mode)
+        end
+    end
+    self.progress_poll = function()
+        self:finishProgressJob()
+    end
+    self.progress_tick = function()
+        self:watchReadingPosition()
+    end
+    -- A device that tells KOReader when it sleeps and wakes needs no looking at
+    -- the clock, only the looks at Reader.
+    self.progress_tick_every = Device:canSuspend() and ReadingProgress.WATCH_EVERY or ReadingProgress.TICK
 
     -- Initialize image download settings
     self.download_images = settings.download_images == nil and true or settings.download_images
@@ -549,6 +582,350 @@ function ReadwiseReader:isDocReady()
 end
 
 -- ===============================================================================
+-- READING POSITION SYNC
+-- ===============================================================================
+-- The open book's position and Reader's reading_progress follow each other.
+-- Reader is asked when a book opens, when the device wakes up, every half minute
+-- while the book lies open, and before every send; this device's position is
+-- sent shortly after a page turn and when the book closes. Nothing depends on
+-- suspend or resume events, which KOReader does not get on every device: a
+-- clock that jumped ahead tells that the device slept.
+-- ReadingProgress holds the rules; the state of the last sync lives in the
+-- book's own settings.
+--
+-- A request to Reader can take seconds, so the automatic ones run in a
+-- subprocess and reading never waits for them.
+
+local PROGRESS_KEY = "readwise_reader_progress"
+
+-- The Reader document behind the open book: one this plugin downloaded. nil for
+-- any other book and in the file manager.
+function ReadwiseReader:getOpenReaderDocument()
+    local file = self.ui and self.ui.document and self.ui.document.file
+    if type(file) ~= "string" or file == "" then
+        return nil
+    end
+    local id = self:getDocumentIdFromPath(file)
+    if not id then
+        return nil
+    end
+    return {
+        id = id,
+        downloaded = true,
+        -- Reader does not accept reading_progress for PDFs yet. A document's
+        -- category is kept with its tags at each sync.
+        can_push = not self:documentHasTag(id, "pdf"),
+    }
+end
+
+-- The map that turns this book's pages into Reader's fractions and back; see
+-- ReadingProgress. Reading the words of every page takes a moment, so it is
+-- made once and kept until the book is laid out differently.
+function ReadwiseReader:getProgressMap()
+    local document = self.ui.document
+    local pages = document:getPageCount()
+    if type(pages) ~= "number" or pages < 1 then
+        return nil
+    end
+    local map = self.progress_map
+    if map and map.pages == pages then
+        return map
+    end
+    local before
+    if self.ui.rolling then
+        local started = os.clock()
+        local ok, result = pcall(function()
+            local counts, words = { 0 }, 0
+            local from = document:getPageXPointer(1)
+            for page = 2, pages do
+                local to = document:getPageXPointer(page)
+                words = words + ReadingProgress.words(document:getTextFromXPointers(from, to))
+                counts[page] = words
+                from = to
+            end
+            return counts
+        end)
+        if ok then
+            before = result
+            logger.info("ReadwiseReader: counted", before[pages], "words on", pages, "pages in",
+                math.floor((os.clock() - started) * 1000), "ms")
+        else
+            logger.warn("ReadwiseReader:getProgressMap: could not read the text, using pages:", result)
+        end
+    end
+    map = ReadingProgress.map(pages, before)
+    self.progress_map = map
+    return map
+end
+
+-- The page the book is open at, and the map to read it by.
+function ReadwiseReader:getLocalPosition()
+    local map = self:getProgressMap()
+    local page = map and self.ui:getCurrentPage()
+    if type(page) ~= "number" then
+        return nil
+    end
+    return math.max(1, math.min(map.pages, page)), map
+end
+
+-- The place left is added to KOReader's location history, so "Go back" returns to it.
+function ReadwiseReader:gotoProgressPage(page)
+    if self.ui.link then
+        self.ui.link:addCurrentLocationToStack()
+    end
+    if self.ui.rolling then
+        self.ui:handleEvent(Event:new("GotoXPointer", self.ui.document:getPageXPointer(page)))
+    else
+        self.ui:handleEvent(Event:new("GotoPage", page))
+    end
+end
+
+-- Reader's position for a document, or nil when it could not be read.
+function ReadwiseReader:fetchReaderProgress(document_id, quick)
+    local result = self.api:requestReader("GET", "/list/?id=" .. document_id, nil, quick)
+    local document = type(result) == "table" and type(result.results) == "table" and result.results[1]
+    return type(document) == "table" and ReadingProgress.fraction(document.reading_progress) or nil
+end
+
+-- Waits `delay` seconds, restarting the wait on each call. A waiting "open" is
+-- due within seconds and is left alone.
+function ReadwiseReader:scheduleProgressSync(mode, delay)
+    if not (self.sync_reading_position and self.progress_ready) or self.progress_pending == "open" then
+        return
+    end
+    self.progress_pending = mode
+    UIManager:unschedule(self.progress_task)
+    UIManager:scheduleIn(delay, self.progress_task)
+end
+
+-- The requests of one sync and what they decide. This may run in a subprocess,
+-- so it touches neither the screen nor the book.
+function ReadwiseReader:exchangeReadingPosition(job)
+    local there = self:fetchReaderProgress(job.id, job.quick)
+    if not there then
+        return { failed = "reading Reader's position" }
+    end
+    local action = ReadingProgress.decide(ReadingProgress.pages(job.map, job.state),
+        job.page, ReadingProgress.pageAt(job.map, there), 1, job.mode == "watch")
+    if action ~= "push" then
+        return { action = action, there = there }
+    end
+    if not job.can_push then
+        return { action = "unsupported", there = there }
+    end
+    local value = ReadingProgress.sendable(ReadingProgress.fractionAt(job.map, job.page), job.downloaded)
+    local sent = self.api:requestReader("PATCH", "/update/" .. job.id .. "/",
+        { reading_progress = value }, job.quick)
+    if not sent then
+        return { failed = "sending the position" }
+    end
+    return { action = "push", there = value, was = there }
+end
+
+-- Acts on the outcome of exchangeReadingPosition. Returns true when the state
+-- of the sync was saved in the book's settings.
+function ReadwiseReader:applyReadingPosition(job, result)
+    local manual = job.mode == "manual"
+    local function report(text)
+        if manual then
+            UIManager:show(InfoMessage:new{ text = text, timeout = 3 })
+        end
+    end
+
+    if result.failed then
+        logger.warn("ReadwiseReader: reading position sync failed for", job.id, "while", result.failed)
+        if not manual then
+            self.progress_failures = (self.progress_failures or 0) + 1
+            self.progress_retry_at = os.time() + ReadingProgress.retryDelay(self.progress_failures)
+        end
+        report("Could not reach Reader to sync the reading position.")
+        return false
+    end
+    self.progress_failures = 0
+    self.progress_synced_at = os.time()
+    if job.mode ~= "watch" then
+        -- Reader has answered a sync that leaves nothing out.
+        self.progress_owed = nil
+    end
+
+    local page, there = job.page, result.there
+    local here = ReadingProgress.fractionAt(job.map, page)
+    if result.action == "unsupported" then
+        report("Reader does not accept reading positions for PDFs yet.")
+        return false
+    elseif result.action == "pull" then
+        -- A closing book is left as it is and moves the next time it opens. If
+        -- pages were turned or the book was laid out anew while Reader answered,
+        -- the next sync decides again.
+        local current, map = self:getLocalPosition()
+        if job.mode == "leave" or current ~= page or map ~= job.map then
+            return false
+        end
+        self:gotoProgressPage(ReadingProgress.pageAt(map, there))
+        page = self:getLocalPosition() or page
+        logger.info("ReadwiseReader: reading position moved to Reader's", there, "page", page,
+            "from page", job.page, "for", job.id)
+        UIManager:show(Notification:new{
+            text = string.format("Reader position: %s (was %s)",
+                ReadingProgress.percent(there), ReadingProgress.percent(here)),
+            timeout = 4,
+        })
+        here = ReadingProgress.fractionAt(map, page)
+    elseif result.action == "push" then
+        logger.info("ReadwiseReader: reading position sent to Reader", there, "page", page,
+            "was", result.was, "for", job.id)
+        report(string.format("Sent %s to Reader.", ReadingProgress.percent(there)))
+    elseif job.mode == "watch" then
+        -- Nothing to do and nothing to remember: a Reader that is behind stays
+        -- a change for the next page turn or opening to act on.
+        return false
+    else
+        logger.info("ReadwiseReader: reading position in sync at", there, "page", page, "for", job.id)
+        report(string.format("Already in sync at %s.", ReadingProgress.percent(there)))
+    end
+
+    self.ui.doc_settings:saveSetting(PROGRESS_KEY, { id = job.id, here = here, there = there })
+    return true
+end
+
+-- Runs exchangeReadingPosition in a subprocess. A closing book does not wait
+-- for the answer: what the requests changed is found the next time it opens.
+function ReadwiseReader:startProgressJob(job)
+    local detached = job.mode == "leave"
+    local pid, read_fd = FFIUtil.runInSubProcess(function(_pid, write_fd)
+        local ok, result = pcall(self.exchangeReadingPosition, self, job)
+        if write_fd then
+            FFIUtil.writeToFD(write_fd,
+                ReadingProgress.encode(ok and result or { failed = tostring(result) }), true)
+        end
+    end, not detached, detached)
+    if not pid then
+        logger.warn("ReadwiseReader:startProgressJob: no subprocess:", read_fd)
+    elseif not detached then
+        self.progress_job = { job = job, pid = pid, fd = read_fd, deadline = os.time() + 60 }
+        self.progress_asked_at = os.time()
+        UIManager:scheduleIn(0.5, self.progress_poll)
+    end
+end
+
+-- Takes the subprocess's answer once it is there and acts on it. With `stop`,
+-- an answer that is not there yet is given up instead of waited for, and the
+-- book is not moved. Returns true when the state of the sync was saved.
+function ReadwiseReader:finishProgressJob(stop)
+    local running = self.progress_job
+    if not running then
+        return false
+    end
+    local done = FFIUtil.isSubProcessDone(running.pid)
+    if not done and not stop then
+        if os.time() > running.deadline then
+            -- Ends it; the next look finds it done, with no answer.
+            FFIUtil.terminateSubProcess(running.pid)
+        end
+        UIManager:scheduleIn(0.5, self.progress_poll)
+        return false
+    end
+    self.progress_job = nil
+    UIManager:unschedule(self.progress_poll)
+    if not done then
+        FFIUtil.terminateSubProcess(running.pid)
+        FFIUtil.isSubProcessDone(running.pid, true)
+        FFIUtil.readAllFromFD(running.fd)
+        return false
+    end
+    if stop then
+        running.job.mode = "leave"
+    end
+    return self:applyReadingPosition(running.job, ReadingProgress.decode(FFIUtil.readAllFromFD(running.fd)))
+end
+
+-- Reader may have been read elsewhere: the book opened, the device woke up or
+-- the network came back. A sync is owed from now until one gets an answer, and
+-- a failure before this moment says nothing about the network as it is now.
+function ReadwiseReader:expectReaderMoved()
+    self.progress_owed = true
+    self.progress_retry_at = nil
+    self.progress_failures = 0
+end
+
+-- Runs every few seconds while a book is open. Starts the sync that is owed as
+-- soon as the network lets it, and otherwise looks at Reader now and then.
+function ReadwiseReader:watchReadingPosition()
+    if not self.progress_ready then
+        return
+    end
+    local now = os.time()
+    local every = self.progress_tick_every
+    if now - (self.progress_ticked_at or now) > every + ReadingProgress.SLEPT then
+        self:expectReaderMoved()
+    end
+    self.progress_ticked_at = now
+    if self.sync_reading_position and not self.progress_pending and not self.progress_job then
+        if self.progress_owed then
+            self:syncReadingPosition("open")
+        elseif now - (self.progress_asked_at or 0) >= ReadingProgress.WATCH_EVERY then
+            self:syncReadingPosition("watch")
+        end
+    end
+    UIManager:scheduleIn(every, self.progress_tick)
+end
+
+-- mode is "open" (Reader may have been read elsewhere: the book opened or the
+-- device woke up), "watch" (a look at Reader while the book lies open), "turn"
+-- (pages were turned), "leave" (the book is closing, so it is never moved) or
+-- "manual". Only "manual" waits for Reader and reports what happened or went
+-- wrong; the others never turn Wi-Fi on and go quiet for a while after a
+-- failed request.
+function ReadwiseReader:syncReadingPosition(mode)
+    local manual = mode == "manual"
+    local document = self:getOpenReaderDocument()
+    if not document then
+        if manual then
+            UIManager:show(InfoMessage:new{ text = "This book was not downloaded from Reader.", timeout = 3 })
+        end
+        return
+    end
+    if manual or mode == "leave" then
+        self:finishProgressJob(true)
+    end
+    local saved = self.ui.doc_settings:readSetting(PROGRESS_KEY)
+    local job = {
+        mode = mode,
+        quick = not manual,
+        id = document.id,
+        downloaded = document.downloaded,
+        can_push = document.can_push,
+        state = type(saved) == "table" and saved.id == document.id and saved or nil,
+    }
+    local function locate()
+        job.page, job.map = self:getLocalPosition()
+        return job.page ~= nil
+    end
+    if manual then
+        if locate() then
+            self:applyReadingPosition(job, self:exchangeReadingPosition(job))
+        end
+        return
+    end
+
+    if not self.access_token or self.access_token == ""
+            or os.time() < (self.progress_retry_at or 0)
+            or not NetworkMgr:isConnected() then
+        return
+    end
+    if not locate() then
+        return
+    end
+    -- A page turn or a closing book has nothing to do unless the page changed
+    -- and Reader would take the new position.
+    if (mode == "turn" or mode == "leave") and not (document.can_push
+            and ReadingProgress.moved(ReadingProgress.pages(job.map, job.state), job.page, 1)) then
+        return
+    end
+    self:startProgressJob(job)
+end
+
+-- ===============================================================================
 -- MAIN MENU AND UI
 -- ===============================================================================
 
@@ -692,6 +1069,16 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 },
             },
             {
+                text = "Sync reading position now",
+                help_text = "Compares this book's position with Reader's: a Reader that is further on is followed, otherwise this book's position is sent. Available in documents downloaded from Reader.",
+                enabled_func = function()
+                    return self:getOpenReaderDocument() ~= nil
+                end,
+                callback = function()
+                    self:onSyncReadwiseReadingPosition()
+                end,
+            },
+            {
                 text = "Settings",
                 sub_item_table = {
                     {
@@ -733,6 +1120,17 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                         callback = function()
                             self.export_highlights_at_sync = not self.export_highlights_at_sync
+                            self:saveSettings()
+                        end,
+                    },
+                    {
+                        text = "Sync reading position with Reader",
+                        help_text = "Keeps the position of a document downloaded from Reader the same here and in Reader. A document read further in Reader moves there when it opens, when the device wakes up, or within half a minute while it lies open; this device's position is sent shortly after a page turn and when the document closes. If both sides moved, the furthest position wins, and Reader is never followed backwards. Reader counts a position in words rather than pages, so its percentage is a little lower than the one shown here for the same page. It does not accept positions for PDFs yet.",
+                        checked_func = function()
+                            return self.sync_reading_position
+                        end,
+                        callback = function()
+                            self.sync_reading_position = not self.sync_reading_position
                             self:saveSettings()
                         end,
                     },
@@ -2521,6 +2919,77 @@ function ReadwiseReader:onSynchronizeReadwiseReader()
     return true
 end
 
+function ReadwiseReader:onSyncReadwiseReadingPosition()
+    self:runSyncAction(function()
+        self:syncReadingPosition("manual")
+    end)
+    return true
+end
+
+function ReadwiseReader:onReaderReady()
+    -- Any other book is left alone: nothing is scheduled while it is open.
+    if not self:getOpenReaderDocument() then
+        return
+    end
+    self.progress_ready = true
+    self.progress_ticked_at = os.time()
+    self:expectReaderMoved()
+    -- After the first page is drawn, so the request does not hold up opening.
+    self:scheduleProgressSync("open", 1)
+    UIManager:unschedule(self.progress_tick)
+    UIManager:scheduleIn(self.progress_tick_every, self.progress_tick)
+end
+
+function ReadwiseReader:onPageUpdate()
+    local idle = os.time() - (self.progress_synced_at or 0)
+    self:scheduleProgressSync("turn", idle > ReadingProgress.IDLE_AFTER and 1 or ReadingProgress.PUSH_DELAY)
+end
+
+-- Scroll mode reports positions rather than pages.
+ReadwiseReader.onPosUpdate = ReadwiseReader.onPageUpdate
+
+-- A new font size or margin moves every page.
+function ReadwiseReader:onDocumentRerendered()
+    self.progress_map = nil
+end
+
+function ReadwiseReader:onCloseDocument()
+    UIManager:unschedule(self.progress_task)
+    UIManager:unschedule(self.progress_tick)
+    self.progress_pending = nil
+    -- An answer that had just arrived is still taken.
+    local saved = self:finishProgressJob(true)
+    if self.progress_ready and self.sync_reading_position then
+        self:syncReadingPosition("leave")
+    end
+    if saved then
+        -- KOReader has already written the book's settings, so write them again.
+        self.ui.doc_settings:flush()
+    end
+    self.progress_ready = false
+end
+
+-- Sent before sleep only when a page turn is still waiting to be sent.
+function ReadwiseReader:onSuspend()
+    if self.progress_pending then
+        UIManager:unschedule(self.progress_task)
+        self.progress_pending = nil
+        self:syncReadingPosition("leave")
+    end
+end
+
+-- Reader may have moved while this device slept. Wi-Fi needs a moment to return.
+function ReadwiseReader:onResume()
+    self.progress_ticked_at = os.time()
+    self:expectReaderMoved()
+    self:scheduleProgressSync("open", 5)
+end
+
+function ReadwiseReader:onNetworkConnected()
+    self:expectReaderMoved()
+    self:scheduleProgressSync("open", 2)
+end
+
 function ReadwiseReader:saveSettings()
     local settings = {
         access_token = self.access_token,
@@ -2539,6 +3008,7 @@ function ReadwiseReader:saveSettings()
         document_source_urls = self.document_source_urls,
         downloaded_documents = self.downloaded_documents,
         reader_highlights = self.reader_highlights,
+        sync_reading_position = self.sync_reading_position,
         download_images = self.download_images,
         max_image_size_mb = self.max_image_size_mb,
         download_covers = self.download_covers,
